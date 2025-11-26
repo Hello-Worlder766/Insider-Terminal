@@ -1,0 +1,318 @@
+import requests
+import xml.etree.ElementTree as ET
+import re
+import sys
+import time
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+# --- Configuration ---
+HEADERS = {
+    'User-Agent': 'InsiderTradingApp Monitor/1.0 (dev@yourdomain.com)'
+}
+# The SEC limits requests to no more than 10 per second. We'll use a 0.15s delay.
+REQUEST_DELAY = 0.15 
+# Define the common SEC namespace for XML parsing
+NAMESPACE = '{http://www.sec.gov/edgar/v1}'
+
+# !!! CONSTRAINT FOR TESTING !!!
+# This limits the number of filings processed to keep execution time reasonable.
+MAX_FILINGS_PER_DAY = 50 
+# Transaction codes we care about: P (Purchase), S (Sale), A (Award), D (Disposal/Disposition)
+TARGET_CODES = ['P', 'S', 'A', 'D'] 
+# Codes used for Estimated Dollar Value calculation (only P and S are typically cash transactions)
+VALUE_CODES = ['P', 'S'] 
+
+# --- Utility Functions ---
+
+def get_edgar_archive_date_url(date):
+    """Generates the URL for the master index file for a given date."""
+    year = date.strftime('%Y')
+    quarter = f"QTR{(date.month - 1) // 3 + 1}"
+    date_path = date.strftime('%Y%m%d')
+    return f"https://www.sec.gov/Archives/edgar/daily-index/{year}/{quarter}/master.{date_path}.idx"
+
+def get_business_days_back(days_back):
+    """Generates a list of recent business days for index lookup."""
+    dates = []
+    current_date = datetime.now()
+    
+    while len(dates) < days_back:
+        current_date -= timedelta(days=1)
+        # Skip Saturday (5) and Sunday (6)
+        if current_date.weekday() < 5: 
+            dates.append(current_date)
+            
+    return dates
+
+# --- Index Lookup (Filtering by Form 4 and now by count) ---
+
+def get_form4_urls_from_index(date, max_count):
+    """
+    Downloads the master.idx file, filters for Form 4 filings, and stops 
+    when max_count is reached.
+    """
+    index_url = get_edgar_archive_date_url(date)
+    form4_urls = []
+    
+    print(f"  -> Downloading Index for {date.strftime('%Y-%m-%d')}...")
+    
+    try:
+        response = requests.get(index_url, headers=HEADERS, timeout=30)
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        if response.status_code == 404:
+            # print(f"  [Info] No index found for {date.strftime('%Y-%m-%d')}.")
+            return []
+        print(f"  [Error] Failed to download index {index_url}: {e}", file=sys.stderr)
+        return []
+    except requests.exceptions.RequestException as e:
+        print(f"  [Error] Network error downloading index {index_url}: {e}", file=sys.stderr)
+        return []
+
+    # Iterate through index lines
+    for line in response.text.splitlines():
+        # Stop collecting URLs once the limit is reached
+        if len(form4_urls) >= max_count:
+            break
+            
+        parts = line.split('|')
+        if len(parts) >= 3 and parts[2] == '4':
+            if len(parts) == 5:
+                file_path = parts[4]
+                full_url = f"https://www.sec.gov/Archives/{file_path}"
+                form4_urls.append(full_url)
+                
+    print(f"  -> Found {len(form4_urls)} Form 4 filings (limited to {max_count}).")
+    return form4_urls
+
+# --- Core Robust Parsing Logic ---
+
+def find_element_robustly(parent, namespaced_tag, local_tag):
+    """
+    Tries to find an element using the full namespace path, then falls back 
+    to the local tag name if the first attempt fails.
+    """
+    element = parent.find(namespaced_tag)
+    if element is None:
+        element = parent.find(local_tag)
+    return element
+
+def safe_extract_value(parent_element, tag_name):
+    """
+    Finds the transaction tag (e.g., transactionShares) and extracts the inner <value>.
+    Returns 0.0 if the element is not found or cannot be converted.
+    """
+    wrapper_path_ns = f'{NAMESPACE}transactionAmounts/{NAMESPACE}{tag_name}'
+    wrapper_path_local = f'transactionAmounts/{tag_name}'
+    wrapper_element = find_element_robustly(parent_element, wrapper_path_ns, wrapper_path_local)
+
+    if wrapper_element is not None:
+        value_path_ns = f'{NAMESPACE}value'
+        value_path_local = 'value'
+        value_element = find_element_robustly(wrapper_element, value_path_ns, value_path_local)
+
+        if value_element is not None and value_element.text:
+            try:
+                return float(value_element.text.replace(',', '').strip())
+            except ValueError:
+                pass 
+    return 0.0
+
+def clean_and_extract_xml(xml_text):
+    """
+    Isolates the pure XML block from the surrounding TXT container and aggressively 
+    cleans up XML declarations and whitespace to aid robust parsing.
+    """
+    START_TAG = "<ownershipDocument"
+    END_TAG = "</ownershipDocument>"
+    
+    start_match = re.search(START_TAG, xml_text, re.IGNORECASE)
+    end_match = re.search(END_TAG, xml_text, re.IGNORECASE | re.DOTALL) 
+    
+    if not start_match:
+        raise ValueError("Could not find the starting tag: <ownershipDocument>")
+        
+    xml_start_index = start_match.start()
+    
+    if end_match:
+        xml_end_index = end_match.end()
+        cleaned_xml = xml_text[xml_start_index:xml_end_index] 
+    else:
+        cleaned_xml = xml_text[xml_start_index:]
+        
+    # Remove XML declaration line (e.g., <?xml version="1.0" ... ?>)
+    cleaned_xml = re.sub(r'<\?xml[^>]*\?>', '', cleaned_xml, flags=re.IGNORECASE)
+    
+    cleaned_xml = cleaned_xml.strip()
+    
+    return cleaned_xml
+
+
+def parse_form4_url(xml_url):
+    """
+    Downloads, cleans, and parses a single Form 4 XML file, returning a list of trades.
+    Only includes trades with TARGET_CODES.
+    """
+    trades = []
+    
+    try:
+        response = requests.get(xml_url, headers=HEADERS, timeout=15)
+        response.raise_for_status()
+        xml_text = response.text
+    except requests.exceptions.RequestException:
+        return trades
+
+    try:
+        cleaned_xml_text = clean_and_extract_xml(xml_text)
+        root = ET.fromstring(cleaned_xml_text)
+        
+        # --- Extract Metadata ---
+        issuer_name_elem = find_element_robustly(root, f'.//{NAMESPACE}issuerName', './/issuerName')
+        issuer_name = issuer_name_elem.text if issuer_name_elem is not None else 'UNKNOWN'
+        
+        issuer_ticker_elem = find_element_robustly(root, f'.//{NAMESPACE}issuerTradingSymbol', './/issuerTradingSymbol')
+        issuer_ticker = issuer_ticker_elem.text.upper() if issuer_ticker_elem is not None else 'N/A'
+
+        # Find all transaction elements (both non-derivative and derivative)
+        non_derivative_transactions = root.findall(f'.//{NAMESPACE}nonDerivativeTransaction', root.tag in root.tag)
+        derivative_transactions = root.findall(f'.//{NAMESPACE}derivativeTransaction', root.tag in root.tag)
+        
+        # Process transactions
+        for transaction in non_derivative_transactions + derivative_transactions:
+            # 1. Transaction Code (MANDATORY FILTER)
+            code_elem = find_element_robustly(transaction, f'.//{NAMESPACE}transactionCode', './/transactionCode')
+            transaction_code = code_elem.text.strip().upper() if code_elem is not None and code_elem.text else 'N/A'
+
+            # Apply the target code filter
+            if transaction_code not in TARGET_CODES:
+                continue
+
+            # 2. Transaction Date (best effort)
+            date_elem = find_element_robustly(transaction, f'.//{NAMESPACE}transactionDate/{NAMESPACE}value', './/transactionDate/value')
+            transaction_date = date_elem.text.strip() if date_elem is not None and date_elem.text else 'N/A'
+
+            # 3. Shares/Amount
+            shares = safe_extract_value(transaction, 'transactionShares')
+            
+            # Skip if no shares or amount
+            if shares == 0.0:
+                continue 
+
+            # 4. Price per share
+            price = safe_extract_value(transaction, 'transactionPricePerShare')
+            
+            # Calculate Value (Shares * Price)
+            value = shares * price
+            
+            # Flag if this transaction code should be used for the value summary
+            is_value_trade = transaction_code in VALUE_CODES
+            
+            trade = {
+                'date': transaction_date,
+                'code': transaction_code,
+                'ticker': issuer_ticker,
+                'shares': shares,
+                'price': price,
+                'value': value,
+                'issuer': issuer_name,
+                'is_value_trade': is_value_trade
+            }
+            trades.append(trade)
+            
+    except ET.ParseError:
+        # print(f"  [Warning] Failed to parse XML for {xml_url}", file=sys.stderr)
+        pass
+    except ValueError as e:
+        # print(f"  [Warning] Content error for {xml_url}: {e}", file=sys.stderr)
+        pass
+        
+    return trades
+
+# --- Reporting and Main Execution ---
+
+def format_report_row(trade):
+    """Formats a single trade entry for the final report."""
+    date = trade['date'].ljust(10)
+    code = trade['code'].ljust(4)
+    ticker = trade['ticker'].ljust(8)
+    shares = f"{trade['shares']:,.0f}".rjust(12)
+    
+    # Format Price: Use currency format, or N/A if 0.0
+    price_str = f"${trade['price']:,.2f}" if trade['price'] > 0 else "N/A"
+    price_formatted = price_str.rjust(14)
+    
+    # Format Value
+    value_formatted = f"${trade['value']:,.2f}".rjust(20)
+    
+    # Format Issuer Name (truncate to 25 chars)
+    issuer_name_truncated = trade['issuer'][:25].ljust(25)
+    
+    return f"{date} {code} {ticker} {shares} {price_formatted} {value_formatted}{issuer_name_truncated}..."
+
+def main():
+    print("Initializing SEC Form 4 Insider Trading Monitor...")
+    all_trades = []
+    transaction_code_counts = defaultdict(int)
+    total_value = 0.0
+    total_trades_count = 0
+    
+    # Look back 5 business days
+    target_dates = get_business_days_back(5)
+    
+    print(f"Targeting Form 4 filings from the last {len(target_dates)} business days.")
+    
+    for date in target_dates:
+        print(f"Processing date: {date.strftime('%Y-%m-%d')}")
+        
+        urls = get_form4_urls_from_index(date, MAX_FILINGS_PER_DAY)
+        
+        # Process each URL found
+        for i, url in enumerate(urls):
+            # print(f"  > Processing ({i+1}/{len(urls)}): {url.split('/')[-1]}", end='\r')
+            
+            trades = parse_form4_url(url)
+            
+            for trade in trades:
+                all_trades.append(trade)
+                transaction_code_counts[trade['code']] += 1
+                total_trades_count += 1
+                
+                # Only include P and S (Purchase/Sale) in the total dollar value calculation
+                if trade['is_value_trade']:
+                    total_value += trade['value']
+            
+            # Enforce rate limit
+            time.sleep(REQUEST_DELAY)
+
+    # --- Generate Report ---
+    
+    # Sort trades by value descending
+    sorted_trades = sorted(all_trades, key=lambda x: x['value'], reverse=True)
+    
+    print("\n" + "="*80)
+    print("AGGREGATE INSIDER TRADING REPORT (Past 5 Business Days)")
+    print("="*80)
+    
+    print("SUMMARY OF TRANSACTION CODES FOUND (Filtered to P, S, A, D):")
+    for code, count in sorted(transaction_code_counts.items(), key=lambda item: item[1], reverse=True):
+        print(f"  Code {code}: {count} transactions")
+
+    print(f"\nTotal Transactions (Shares > 0) Found: {total_trades_count}")
+    print(f"Total Estimated Dollar Value (P/S only): ${total_value:,.2f}\n")
+
+    print("Date        Code Ticker         Shares          Price       Value (USD)Issuer (25 chars)          ")
+    print("----------------------------------------------------------------------------------------------------")
+    
+    # Display top 20 trades
+    for trade in sorted_trades[:20]:
+        print(format_report_row(trade))
+
+    print("\n... and more. Displaying top 20 trades by value.")
+    print("----------------------------------------------------------------------------------------------------")
+    print("NOTE: The report now only includes transaction codes P, S, A, and D.")
+
+if __name__ == '__main__':
+    # Increase recursion limit for deep XML parsing if necessary (optional safeguard)
+    # sys.setrecursionlimit(2000)
+    main()
