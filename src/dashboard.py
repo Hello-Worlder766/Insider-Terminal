@@ -52,8 +52,6 @@ def load_data():
 def save_data(data):
     """
     Saves trade data to the JSON file.
-    
-    *** FIX FOR FileNotFoundError: Ensures the directory is created before writing. ***
     """
     ensure_data_directory_exists()
     
@@ -74,13 +72,42 @@ def clean_and_convert_value(value_str):
     except (ValueError, TypeError):
         return 0.0
 
-# --- API Endpoint for Scraper (Uploader) ---
+
+def deduplicate_trades(trades):
+    """
+    Removes duplicate trades based on a composite key:
+    (date, ticker, filer, code, shares, price).
+    """
+    unique_trades = {}
+    
+    for trade in trades:
+        # Create a tuple key that uniquely identifies the transaction
+        # Uses date, issuer, filer, transaction type, quantity, and price.
+        unique_key = (
+            trade.get('date'),
+            trade.get('ticker'),
+            trade.get('filer'),
+            trade.get('code'),
+            # Convert shares and price to strings to make them hashable
+            str(trade.get('shares', 0.0)),
+            str(trade.get('price', 0.0))
+        )
+        
+        # Use the dictionary to enforce uniqueness. If the key is already in 
+        # the dict, we skip the trade, ensuring the first instance is kept.
+        if unique_key not in unique_trades:
+            unique_trades[unique_key] = trade
+            
+    return list(unique_trades.values())
+
+
+# --- API Endpoint 1: Permanent Data Ingestion with Deduplication ---
 
 @app.route('/api/upload_trades', methods=['POST'])
 def upload_trades():
     """
-    Receives trade data from the external scraper script.
-    Requires a valid API key for security, checked in the X-API-KEY header.
+    Receives new trade data, merges it with existing data, and deduplicates the
+    ENTIRE set before saving. This is the permanent fix for duplicates.
     """
 
     if not request.is_json:
@@ -95,17 +122,66 @@ def upload_trades():
         print(f"Upload attempt failed. Invalid key received: {received_key}")
         return jsonify({"message": "Unauthorized: Invalid API Key"}), 403
 
-    trades = payload.get('trades', [])
+    new_trades = payload.get('trades', [])
 
-    if not isinstance(trades, list):
+    if not isinstance(new_trades, list):
         return jsonify({"message": "Invalid data format: 'trades' must be a list"}), 400
 
-    # 2. Save the new data, overwriting the old file
-    # save_data now automatically ensures the directory exists
-    save_data(trades)
+    # Load existing data
+    existing_trades = load_data()
+    
+    # Merge existing trades and new trades
+    combined_trades = existing_trades + new_trades
+    
+    # Deduplicate the entire combined set
+    initial_count = len(combined_trades)
+    final_trades = deduplicate_trades(combined_trades)
+    
+    # Save the cleaned, final data, overwriting the old file
+    save_data(final_trades)
 
-    print(f"Successfully received and saved {len(trades)} trades.")
-    return jsonify({"message": f"Successfully processed {len(trades)} trades."}), 200
+    deduped_count = len(final_trades)
+    duplicates_removed = initial_count - deduped_count
+        
+    return jsonify({"message": f"Successfully processed. Total unique trades saved: {deduped_count}. Removed {duplicates_removed} duplicates during merge."}), 200
+
+
+# --- API Endpoint 2: One-Time Cleanup Tool ---
+
+@app.route('/api/clean_data', methods=['POST'])
+def clean_data():
+    """
+    One-time tool to clean duplicates from the existing data file.
+    Requires API key for execution.
+    """
+    # 1. AUTHENTICATION: Validate the incoming API key
+    received_key = request.headers.get('X-API-KEY')
+
+    if received_key != DASHBOARD_API_KEY:
+        return jsonify({"message": "Unauthorized: Invalid API Key"}), 403
+
+    # Load existing data
+    existing_trades = load_data()
+    
+    if not existing_trades:
+        return jsonify({"message": "Data file is already empty or unreadable."}), 200
+
+    # Deduplicate the existing set
+    initial_count = len(existing_trades)
+    cleaned_trades = deduplicate_trades(existing_trades)
+    final_count = len(cleaned_trades)
+    duplicates_removed = initial_count - final_count
+
+    # Save the cleaned data
+    save_data(cleaned_trades)
+
+    if duplicates_removed > 0:
+        message = f"Cleanup successful! Removed {duplicates_removed} duplicates. Total unique trades remaining: {final_count}."
+    else:
+        message = "Cleanup successful! No duplicates found in the existing file."
+
+    print(f"DIAGNOSTIC: {message}")
+    return jsonify({"message": message}), 200
 
 # --- Dashboard Frontend with Sorting and Filtering ---
 
@@ -381,7 +457,7 @@ if __name__ == '__main__':
 
     # Now we print the correct port being used
     print(f"Dashboard available at: http://127.0.0.1:{port_to_use}/")
-    print(f"API Endpoint: /api/upload_trades (Listening)")
+    print(f"API Endpoints: /api/upload_trades (Permanent Fix) | /api/clean_data (One-Time Tool)")
 
     # For security, do not print the full API key. Print an informational message instead.
     if DASHBOARD_API_KEY:
