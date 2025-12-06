@@ -100,9 +100,63 @@ def deduplicate_trades(trades):
             
     return list(unique_trades.values())
 
+def group_trades_by_filing(trades):
+    """
+    Groups individual trade transactions into single filing lines based on 
+    (ticker, insider name, and date), summarizing the total value and transaction types.
+    """
+    grouped_trades = {}
+
+    for trade in trades:
+        ticker = trade.get('ticker')
+        filer = trade.get('filer')
+        date = trade.get('date')
+        
+        # Define the unique key for aggregation
+        if not all([ticker, filer, date]):
+            continue
+            
+        # The key combines the insider, ticker, and date to represent a single filing block
+        group_key = (ticker, filer, date)
+        
+        trade_value = clean_and_convert_value(trade.get('value'))
+        trade_code = trade.get('code')
+
+        if group_key not in grouped_trades:
+            # Initialize a new consolidated filing record
+            grouped_trades[group_key] = {
+                'ticker': ticker,
+                'company_name': trade.get('company_name', 'Company Name Missing'),
+                'filer': filer,
+                # Keep the original title, as it usually represents the filer's role
+                'person_title': trade.get('person_title', 'Title Missing'), 
+                'date': date,
+                'total_value': trade_value, # Store as float for easy sorting
+                # Use a set to track unique transaction codes/types (P, S, M, etc.)
+                'codes': {trade_code} if trade_code else set(),
+            }
+        else:
+            # Aggregate existing record
+            agg_trade = grouped_trades[group_key]
+            agg_trade['total_value'] += trade_value
+            if trade_code:
+                agg_trade['codes'].add(trade_code)
+
+    # Finalize the aggregated list
+    final_list = []
+    for agg_trade in grouped_trades.values():
+        # Summarize the codes set into a string (e.g., {'S', 'P'} -> 'P/S')
+        agg_trade['summary_code'] = '/'.join(sorted(list(agg_trade['codes'])))
+        
+        # Remove the temporary 'codes' set
+        del agg_trade['codes']
+        
+        final_list.append(agg_trade)
+        
+    return final_list
+
 
 # --- API Endpoint 1: Permanent Data Ingestion with Deduplication ---
-
 @app.route('/api/upload_trades', methods=['POST'])
 def upload_trades():
     """
@@ -147,7 +201,6 @@ def upload_trades():
 
 
 # --- API Endpoint 2: One-Time Cleanup Tool ---
-
 @app.route('/api/clean_data', methods=['POST'])
 def clean_data():
     """
@@ -188,21 +241,30 @@ def clean_data():
 @app.route('/')
 def dashboard():
     """Renders the main dashboard page, applying sorting and filtering."""
+    
+    # 1. Load the raw data
     all_trades = load_data()
     
-    # --- 1. Get filter and sort parameters from the URL query string ---
+    # 2. NEW STEP: Group the transaction-level data into filing-level data
+    aggregated_trades = group_trades_by_filing(all_trades)
+    
+    # --- 3. Get filter and sort parameters from the URL query string ---
     # Default sort is by date descending
     sort_by = request.args.get('sort_by', 'date') 
     # NEW: Get sort order (default is 'desc')
     sort_order = request.args.get('order', 'desc')
     filter_ticker = request.args.get('filter_ticker', '').upper().strip()
     
-    # --- 2. Apply Filtering Logic ---
+    # --- 4. Apply Filtering Logic ---
     
-    # A. Filter by Minimum Value (Applies to ALL trades)
+    # Start filtering on the aggregated list
+    trades_to_display = aggregated_trades
+    
+    # A. Filter by Minimum Value (Now checking 'total_value' on the aggregated list)
     trades_to_display = [
-        trade for trade in all_trades
-        if clean_and_convert_value(trade.get('value')) >= MIN_TRADE_VALUE
+        trade for trade in trades_to_display
+        # 'total_value' is already a float from group_trades_by_filing
+        if trade.get('total_value', 0.0) >= MIN_TRADE_VALUE 
     ]
 
     # B. Filter by Ticker (Applies only if a ticker is entered in the form)
@@ -212,36 +274,51 @@ def dashboard():
             if trade.get('ticker', '').upper() == filter_ticker
         ]
 
-    # --- 3. Apply Sorting Logic ---
+    # --- 5. Apply Sorting Logic ---
     if trades_to_display:
         # Determine the key to sort by and the reversal direction
         reverse_sort = sort_order == 'desc'
         sort_key = sort_by
         
         if sort_key == 'value':
-            # Use the new helper function for cleaner numeric sorting
+            # Use 'total_value' directly, as it is a clean float
             trades_to_display.sort(
-                key=lambda x: clean_and_convert_value(x.get('value')),
+                key=lambda x: x.get('total_value', 0.0), 
                 reverse=reverse_sort
             )
         else:
             # Sort by string keys (date, ticker, filer)
             trades_to_display.sort(key=lambda x: x.get(sort_key, ''), reverse=reverse_sort)
             
-        # Get the date of the most recent trade for the header banner
+        # Get the date of the most recent trade for the header banner (still using raw data)
         latest_update_date = max([t.get('date', '0000-00-00') for t in all_trades]) if all_trades else 'N/A'
     else:
         latest_update_date = 'N/A'
 
 
-    # Simple logic to determine color based on transaction type
-    def get_row_class(txn_type):
-        # Dark mode colors
-        if txn_type in ['P', 'Buy']: # P is typically Purchase, S is Sale
-            return 'bg-green-900/40 hover:bg-green-800/40' # Darker, subtle green
-        elif txn_type in ['S', 'Sell']:
-            return 'bg-red-900/40 hover:bg-red-800/40' # Darker, subtle red
+    # Aesthetic Helpers (New Logic)
+    def get_bg_class(txn_code):
+        """Returns a subtle background class based on the dominant action (Sale or Purchase)."""
+        # Prioritize Sale (Red)
+        if 'S' in txn_code:
+            # Very subtle red background
+            return 'bg-red-900/10 hover:bg-red-800/10'
+        # Prioritize Purchase (Green) if no Sale
+        elif 'P' in txn_code:
+            # Very subtle green background
+            return 'bg-green-900/10 hover:bg-green-800/10'
+        # Default for M or other codes (Neutral)
         return 'bg-gray-800/40 hover:bg-gray-700/40'
+
+    def get_text_class(txn_code):
+        """Returns a vibrant text color class for the key fields (Value, Type)."""
+        if 'S' in txn_code:
+            return 'text-red-400' 
+        elif 'P' in txn_code:
+            return 'text-green-400'
+        # Neutral/M: Using yellow to visually separate from regular white text
+        return 'text-yellow-400' 
+
 
     # Helper to generate the new URL query string for sorting links
     def get_sort_link(column_name):
@@ -274,20 +351,22 @@ def dashboard():
     
     if trades_to_display:
         for trade in trades_to_display:
-            # --- UPDATED: Fetching new fields ---
+            # The trade object is now the aggregated filing record
             ticker = trade.get('ticker', 'N/A')
             company_name = trade.get('company_name', 'Company Name Missing')
             filer_name = trade.get('filer', 'N/A')
-            person_title = trade.get('person_title', 'Title Missing') # Assumes 'person_title' is the key
+            person_title = trade.get('person_title', 'Title Missing') 
             trade_date = trade.get('date', 'N/A')
-            code = trade.get('code', 'N/A')
-            value = trade.get('value', 0.0)
+            code = trade.get('summary_code', 'N/A')
+            value = trade.get('total_value', 0.0) 
 
-            row_class = get_row_class(code)
+            # Apply new color logic
+            row_class = get_bg_class(code)
+            text_color_class = get_text_class(code)
 
             # Format the value for better readability
             try:
-                formatted_value = f"${clean_and_convert_value(value):,.2f}"
+                formatted_value = f"${value:,.2f}"
             except Exception:
                 formatted_value = "$N/A"
                     
@@ -298,8 +377,9 @@ def dashboard():
                 <td class="px-4 py-3 text-gray-300">{filer_name}</td>
                 <td class="px-4 py-3 text-gray-400 text-sm italic">{person_title}</td>
                 <td class="px-4 py-3 whitespace-nowrap text-gray-400">{trade_date}</td>
-                <td class="px-4 py-3 font-mono text-right text-lg font-bold">{formatted_value}</td>
-                <td class="px-4 py-3 font-extrabold text-center">{code}</td>
+                <!-- Apply color and bolding to Value and Type -->
+                <td class="px-4 py-3 font-mono text-right text-lg font-bold {text_color_class}">{formatted_value}</td>
+                <td class="px-4 py-3 font-extrabold text-center {text_color_class}">{code}</td>
             </tr>
             """
     else:
@@ -331,10 +411,6 @@ def dashboard():
         .sortable-header:hover {{ cursor: pointer; color: #60a5fa; }}
         .header-link {{ color: #9ca3af; }}
         .header-link:hover {{ color: #e5e7eb; }}
-        /* Specific code colors */
-        .bg-green-900/40 {{ color: #34d399; }} /* Green text for Buy */
-        .bg-red-900/40 {{ color: #f87171; }} /* Red text for Sell */
-        .bg-gray-800/40 {{ color: #9ca3af; }} /* Grey text for Other */
     </style>
 </head>
 <body>
